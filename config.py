@@ -11,11 +11,18 @@ Required env vars:
   FERNET_KEY          -> Key used to encrypt auth tokens at rest (generate once, keep secret)
   SUPABASE_URL        -> Your Supabase project URL (Project Settings -> API)
   SUPABASE_SERVICE_KEY -> Supabase *service_role* key (server-side only, never expose to a client)
+
+For local development, put these in a `.env` file (see `.env.example`) —
+this file auto-loads it. In production (Render, Railway, etc.) set these
+as actual environment variables in the host's dashboard instead; .env
+files are for local dev only and should never be committed to git.
 """
 import os
+import sys
+
 from dotenv import load_dotenv
 
-load_dotenv()  # loads variables from .env into os.environ
+load_dotenv()  # loads .env into os.environ if present; no-op if it doesn't exist
 
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
@@ -31,3 +38,21 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 GRAPH_API_VERSION = "v20.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+
+# Fail loudly and clearly at startup rather than letting a downstream
+# library (e.g. supabase-py) raise a cryptic "Invalid API key" error.
+_REQUIRED = {
+    "PAGE_ACCESS_TOKEN": PAGE_ACCESS_TOKEN,
+    "VERIFY_TOKEN": VERIFY_TOKEN,
+    "APP_SECRET": APP_SECRET,
+    "FERNET_KEY": FERNET_KEY,
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_SERVICE_KEY": SUPABASE_SERVICE_KEY,
+}
+_missing = [name for name, value in _REQUIRED.items() if not value]
+if _missing:
+    sys.exit(
+        "Missing required environment variable(s): " + ", ".join(_missing) +
+        "\nLocally: add them to a .env file (see .env.example) in the same folder as app.py."
+        "\nOn Render/Railway/etc.: set them in the host's dashboard under Environment Variables."
+    )
