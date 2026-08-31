@@ -1,10 +1,9 @@
 """
 Thin wrapper around jdwebnship's Login and Order Create APIs.
 
-NOTE: The exact request/response shape below is a placeholder based on
-typical login/order APIs. Swap in the real field names once you have the
-jdwebnship API docs — everything else in the bot stays the same as long
-as these two functions keep returning (success: bool, data: dict).
+Order Create endpoint: POST {JD_ORDER_CREATE_URL}
+  e.g. https://ndstage.jdwebnship.in/api/bot/direct-order
+Auth header: Authorization: Bearer <auth_token>  (auth_token comes from Login)
 """
 import requests
 import config
@@ -41,16 +40,30 @@ def login(email: str, password: str) -> tuple[bool, dict]:
 
 def create_order(auth_token: str, order: dict) -> tuple[bool, dict]:
     """
-    Calls jdwebnship Order Create API.
-    `order` example payload (matches the format given):
+    Calls jdwebnship's POST /api/bot/direct-order.
+
+    `order` payload shape (required fields always present, optional fields
+    only included when the retailer actually provided them):
         {
-            "customer": "Sadashiva",
-            "phone": "9109066064",
-            "address": "Sadashiva Nagar, Nelamangala, Karnataka – 562123, Near Tejaswini Transport",
-            "product": "Jamalgota Oil + Powder 100gm Combo Pack",
-            "amount": 899
+            "product_name": "Blue T-Shirt",
+            "product_sku": "SKU-001",            # optional
+            "subcategory": "T-SHIRTS",            # optional
+            "qty": 1,
+            "price": 499,
+            "product_weight": "0.5",              # "0.5" or "2"
+            "payment_method": "cod",
+            "customer_mobile": "9876543210",
+            "customer_full_name": "Rahul Sharma",
+            "email": "rahul@example.com",         # optional
+            "customer_alt_number": "9123456780",  # optional
+            "customer_address": "123 MG Road",
+            "pincode": "560001",
+            "state": "Karnataka",                 # optional
+            "city": "Bangalore"                   # optional
         }
-    Returns (success, data_or_error).
+    Returns (success, data_or_error). Assumes a successful response includes
+    some kind of order reference (e.g. "order_id") — adjust the key in
+    app.py's submit_order() once you see a real response shape.
     """
     headers = {"Authorization": f"Bearer {auth_token}"}
     try:

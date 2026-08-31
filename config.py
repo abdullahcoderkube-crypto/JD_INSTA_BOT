@@ -28,8 +28,8 @@ PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 APP_SECRET = os.environ.get("APP_SECRET", "")
 
-JD_LOGIN_URL = os.environ.get("JD_LOGIN_URL", "https://api.jdwebnship.example.com/login")
-JD_ORDER_CREATE_URL = os.environ.get("JD_ORDER_CREATE_URL", "https://api.jdwebnship.example.com/order/create")
+JD_LOGIN_URL = os.environ.get("JD_LOGIN_URL", "https://ndstage.jdwebnship.in/api/bot/login")
+JD_ORDER_CREATE_URL = os.environ.get("JD_ORDER_CREATE_URL", "https://ndstage.jdwebnship.in/api/bot/direct-order")
 
 FERNET_KEY = os.environ.get("FERNET_KEY", "")  # generate with Fernet.generate_key()
 

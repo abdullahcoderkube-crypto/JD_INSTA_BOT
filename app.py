@@ -12,8 +12,12 @@ Flow:
        fail    -> back to AWAITING_EMAIL with error message
   AUTHENTICATED
     -> show Order / Log Out buttons
-  ORDER_CUSTOMER -> ORDER_PHONE -> ORDER_ADDRESS -> ORDER_PRODUCT -> ORDER_AMOUNT -> ORDER_CONFIRM
-    -> collects order fields one at a time, then confirms before calling Order Create API
+  ORDER_<field>
+    -> walks through every REQUIRED_ORDER field one at a time (text prompts,
+       or quick-reply buttons for constrained fields like product_weight and
+       payment_method), then asks whether to add optional details, then
+       walks OPTIONAL_ORDER fields (each skippable), then confirms and
+       calls Order Create.
 
 Run:
     export PAGE_ACCESS_TOKEN=... VERIFY_TOKEN=... APP_SECRET=... FERNET_KEY=...
@@ -33,14 +37,56 @@ import state_manager
 app = Flask(__name__)
 state_manager.init_db()
 
-ORDER_FIELDS = ["customer", "phone", "address", "product", "amount"]
-ORDER_PROMPTS = {
-    "customer": "What's the customer's name?",
-    "phone": "What's the customer's phone number?",
-    "address": "What's the delivery address?",
-    "product": "Which product (and variant/pack size) are they ordering?",
-    "amount": "What's the order amount (₹)?",
+# ---------------------------------------------------------------------------
+# Order field definitions — matches jdwebnship's /api/bot/direct-order payload
+# ---------------------------------------------------------------------------
+
+FIELD_DEFS = {
+    "product_name": {"prompt": "What's the product name?", "type": "text"},
+    "qty": {"prompt": "How many units?", "type": "text"},
+    "price": {"prompt": "What's the price (in ₹)?", "type": "text"},
+    "product_weight": {
+        "prompt": "What's the product weight category?",
+        "type": "choice",
+        "options": [("0.5 kg", "0.5"), ("2 kg", "2")],
+    },
+    "customer_full_name": {"prompt": "What's the customer's full name?", "type": "text"},
+    "customer_mobile": {"prompt": "What's the customer's mobile number?", "type": "text"},
+    "customer_address": {"prompt": "What's the delivery address?", "type": "text"},
+    "pincode": {"prompt": "What's the delivery pincode?", "type": "text"},
+    "product_sku": {"prompt": "Product SKU?", "type": "text"},
+    "subcategory": {"prompt": "Product subcategory?", "type": "text"},
+    "email": {"prompt": "Customer's email?", "type": "text"},
+    "customer_alt_number": {"prompt": "Customer's alternate phone number?", "type": "text"},
+    "state": {"prompt": "Customer's state?", "type": "text"},
+    "city": {"prompt": "Customer's city?", "type": "text"},
 }
+
+FIELD_LABELS = {
+    "product_name": "Product",
+    "qty": "Quantity",
+    "price": "Price (₹)",
+    "product_weight": "Weight (kg)",
+    "payment_method": "Payment method",
+    "customer_full_name": "Customer name",
+    "customer_mobile": "Mobile",
+    "customer_address": "Address",
+    "pincode": "Pincode",
+    "product_sku": "SKU",
+    "subcategory": "Subcategory",
+    "email": "Email",
+    "customer_alt_number": "Alternate number",
+    "state": "State",
+    "city": "City",
+}
+
+REQUIRED_ORDER = [
+    "product_name", "qty", "price", "product_weight",
+    "customer_full_name", "customer_mobile", "customer_address", "pincode",
+]
+OPTIONAL_ORDER = [
+    "product_sku", "subcategory", "email", "customer_alt_number", "state", "city",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +147,98 @@ def receive_webhook():
 
 
 # ---------------------------------------------------------------------------
+# Order flow helpers
+# ---------------------------------------------------------------------------
+
+def send_field_prompt(psid: str, field_key: str):
+    field = FIELD_DEFS[field_key]
+    if field["type"] == "choice":
+        messenger_client.send_quick_replies(
+            psid, field["prompt"],
+            [{"title": label, "payload": f"ORDER_SET::{field_key}::{value}"}
+             for label, value in field["options"]],
+        )
+    elif field_key in OPTIONAL_ORDER:
+        messenger_client.send_quick_replies(
+            psid, field["prompt"],
+            [{"title": "Skip", "payload": f"ORDER_SKIP::{field_key}"}],
+        )
+    else:
+        messenger_client.send_text(psid, field["prompt"])
+
+
+def advance_order(psid: str, temp_data: dict, current_field: str):
+    if current_field in REQUIRED_ORDER:
+        idx = REQUIRED_ORDER.index(current_field)
+        if idx + 1 < len(REQUIRED_ORDER):
+            next_field = REQUIRED_ORDER[idx + 1]
+            state_manager.update_session(psid, state=f"ORDER_{next_field}", temp_data=temp_data)
+            send_field_prompt(psid, next_field)
+        else:
+            state_manager.update_session(psid, state="ORDER_ASK_OPTIONAL", temp_data=temp_data)
+            messenger_client.send_quick_replies(
+                psid,
+                "Want to add optional details (SKU, subcategory, email, "
+                "alternate number, state, city)?",
+                [
+                    {"title": "Yes, add more", "payload": "ORDER_OPTIONAL_YES"},
+                    {"title": "No, place order", "payload": "ORDER_OPTIONAL_NO"},
+                ],
+            )
+    elif current_field in OPTIONAL_ORDER:
+        idx = OPTIONAL_ORDER.index(current_field)
+        if idx + 1 < len(OPTIONAL_ORDER):
+            next_field = OPTIONAL_ORDER[idx + 1]
+            state_manager.update_session(psid, state=f"ORDER_{next_field}", temp_data=temp_data)
+            send_field_prompt(psid, next_field)
+        else:
+            state_manager.update_session(psid, state="ORDER_CONFIRM", temp_data=temp_data)
+            confirm_order(psid, temp_data)
+
+
+def validate_field(field_key: str, text: str):
+    """Returns (is_valid, cleaned_value_or_error_message)."""
+    text = text.strip()
+    if field_key == "qty":
+        if not text.isdigit() or int(text) <= 0:
+            return False, "Please enter a valid quantity (a positive whole number)."
+        return True, text
+    if field_key == "price":
+        try:
+            float(text)
+        except ValueError:
+            return False, "Please enter a valid price (numbers only)."
+        return True, text
+    if field_key == "pincode":
+        if not (text.isdigit() and len(text) == 6):
+            return False, "Please enter a valid 6-digit pincode."
+        return True, text
+    if field_key in ("customer_mobile", "customer_alt_number"):
+        digits = text.replace(" ", "").replace("-", "")
+        if not (digits.isdigit() and len(digits) == 10):
+            return False, "Please enter a valid 10-digit mobile number."
+        return True, digits
+    return True, text
+
+
+def confirm_order(psid: str, order: dict):
+    lines = ["Please confirm this order:\n"]
+    lines.append(f"{FIELD_LABELS['payment_method']}: Cash on Delivery (COD)")
+    for field in REQUIRED_ORDER + OPTIONAL_ORDER:
+        if order.get(field):
+            lines.append(f"{FIELD_LABELS[field]}: {order[field]}")
+    messenger_client.send_text(psid, "\n".join(lines))
+    messenger_client.send_quick_replies(
+        psid,
+        "Confirm and place this order?",
+        [
+            {"title": "✅ Confirm", "payload": "ORDER_CONFIRM_YES"},
+            {"title": "❌ Cancel", "payload": "ORDER_CONFIRM_NO"},
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Postback (button tap) handling
 # ---------------------------------------------------------------------------
 
@@ -124,8 +262,30 @@ def handle_postback(psid: str, payload: str):
             messenger_client.send_text(psid, "Please log in first.")
             messenger_client.main_menu(psid, authenticated=False)
             return
-        state_manager.update_session(psid, state="ORDER_customer", temp_data={})
-        messenger_client.send_text(psid, ORDER_PROMPTS["customer"])
+        first_field = REQUIRED_ORDER[0]
+        state_manager.update_session(
+            psid, state=f"ORDER_{first_field}", temp_data={"payment_method": "cod"}
+        )
+        send_field_prompt(psid, first_field)
+
+    elif payload.startswith("ORDER_SET::"):
+        _, field, value = payload.split("::", 2)
+        temp = session["temp_data"]
+        temp[field] = value
+        advance_order(psid, temp, field)
+
+    elif payload.startswith("ORDER_SKIP::"):
+        _, field = payload.split("::", 1)
+        advance_order(psid, session["temp_data"], field)
+
+    elif payload == "ORDER_OPTIONAL_YES":
+        first_optional = OPTIONAL_ORDER[0]
+        state_manager.update_session(psid, state=f"ORDER_{first_optional}", temp_data=session["temp_data"])
+        send_field_prompt(psid, first_optional)
+
+    elif payload == "ORDER_OPTIONAL_NO":
+        state_manager.update_session(psid, state="ORDER_CONFIRM", temp_data=session["temp_data"])
+        confirm_order(psid, session["temp_data"])
 
     elif payload == "ORDER_CONFIRM_YES":
         submit_order(psid, session)
@@ -171,52 +331,54 @@ def handle_text(psid: str, text: str):
             messenger_client.send_text(psid, "Please re-enter your email address:")
         return
 
-    if state.startswith("ORDER_"):
+    if state.startswith("ORDER_") and state not in ("ORDER_ASK_OPTIONAL", "ORDER_CONFIRM"):
         field = state.split("ORDER_", 1)[1]
-        if field in ORDER_FIELDS:
+        if field in FIELD_DEFS:
+            if FIELD_DEFS[field]["type"] == "choice":
+                messenger_client.send_text(psid, "Please tap one of the buttons above to choose an option.")
+                send_field_prompt(psid, field)
+                return
+            valid, result = validate_field(field, text)
+            if not valid:
+                messenger_client.send_text(psid, result)
+                return
             temp = session["temp_data"]
-            temp[field] = text
-            next_field = _next_order_field(field)
-            if next_field:
-                state_manager.update_session(psid, state=f"ORDER_{next_field}", temp_data=temp)
-                messenger_client.send_text(psid, ORDER_PROMPTS[next_field])
-            else:
-                state_manager.update_session(psid, state="ORDER_CONFIRM", temp_data=temp)
-                confirm_order(psid, temp)
+            temp[field] = result
+            advance_order(psid, temp, field)
             return
 
     # Fallback — unrecognised input for current state
     messenger_client.main_menu(psid, authenticated=bool(session["auth_token"]))
 
 
-def _next_order_field(current: str):
-    idx = ORDER_FIELDS.index(current)
-    return ORDER_FIELDS[idx + 1] if idx + 1 < len(ORDER_FIELDS) else None
+# ---------------------------------------------------------------------------
+# Order submission
+# ---------------------------------------------------------------------------
 
-
-def confirm_order(psid: str, order: dict):
-    summary = (
-        f"Please confirm this order:\n\n"
-        f"Customer: {order['customer']}\n"
-        f"Phone: {order['phone']}\n"
-        f"Address: {order['address']}\n"
-        f"Product: {order['product']}\n"
-        f"Amount: ₹{order['amount']}"
-    )
-    messenger_client.send_text(psid, summary)
-    messenger_client.send_quick_replies(
-        psid,
-        "Confirm and place this order?",
-        [
-            {"title": "✅ Confirm", "payload": "ORDER_CONFIRM_YES"},
-            {"title": "❌ Cancel", "payload": "ORDER_CONFIRM_NO"},
-        ],
-    )
+def _to_number(text: str):
+    return float(text) if "." in text else int(text)
 
 
 def submit_order(psid: str, session: dict):
     order = session["temp_data"]
-    success, data = jdwebnship_client.create_order(session["auth_token"], order)
+
+    payload = {
+        "product_name": order["product_name"],
+        "qty": int(order["qty"]),
+        "price": _to_number(order["price"]),
+        "product_weight": order["product_weight"],
+        "payment_method": order["payment_method"],
+        "customer_mobile": order["customer_mobile"],
+        "customer_full_name": order["customer_full_name"],
+        "customer_address": order["customer_address"],
+        "pincode": order["pincode"],
+    }
+    # Optional fields only included if the retailer actually provided them
+    for field in OPTIONAL_ORDER:
+        if order.get(field):
+            payload[field] = order[field]
+
+    success, data = jdwebnship_client.create_order(session["auth_token"], payload)
 
     if success:
         order_ref = data.get("order_id", "N/A")
