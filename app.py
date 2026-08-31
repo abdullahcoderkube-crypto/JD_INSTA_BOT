@@ -75,10 +75,15 @@ def _valid_signature(req) -> bool:
 
 @app.route("/webhook", methods=["POST"])
 def receive_webhook():
+    print("[webhook] Incoming POST received", flush=True)
+
     if not _valid_signature(request):
+        print("[webhook] Rejected: invalid signature", flush=True)
         return "Invalid signature", 403
 
     body = request.get_json(force=True, silent=True) or {}
+    print(f"[webhook] Payload: {body}", flush=True)
+
     for entry in body.get("entry", []):
         for event in entry.get("messaging", []):
             psid = event["sender"]["id"]
