@@ -12,6 +12,13 @@ Required env vars:
   SUPABASE_URL        -> Your Supabase project URL (Project Settings -> API)
   SUPABASE_SERVICE_KEY -> Supabase *service_role* key (server-side only, never expose to a client)
 
+Optional env vars:
+  GROQ_API_KEY        -> Groq API key; enables AI free-form order extraction
+  GROQ_MODEL          -> Groq model name (default: moonshotai/kimi-k2-instruct)
+  GROQ_BASE_URL       -> Groq API base URL (default: https://api.groq.com/openai/v1)
+  GROQ_TIMEOUT        -> HTTP timeout in seconds for Groq calls (default: 45)
+  GROQ_MAX_TOKENS     -> Max completion tokens for Groq responses (default: 4500)
+
 For local development, put these in a `.env` file (see `.env.example`) —
 this file auto-loads it. In production (Render, Railway, etc.) set these
 as actual environment variables in the host's dashboard instead; .env
@@ -35,6 +42,13 @@ FERNET_KEY = os.environ.get("FERNET_KEY", "")  # generate with Fernet.generate_k
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+# Groq AI — free-form order extraction. Optional; bot falls back to manual wizard if absent.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_TIMEOUT = int(os.environ.get("GROQ_TIMEOUT", "45"))
+GROQ_MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "4500"))
 
 GRAPH_API_VERSION = "v20.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"

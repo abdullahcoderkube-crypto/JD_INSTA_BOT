@@ -65,8 +65,9 @@ def main_menu(psid: str, authenticated: bool):
             psid,
             "What would you like to do?",
             [
-                {"title": "Place Order", "payload": "ORDER"},
-                {"title": "Log Out", "payload": "LOGOUT"},
+                {"title": "Place Order 🛒", "payload": "ORDER"},
+                {"title": "Fill Manually 📝", "payload": "ORDER_MANUAL"},
+                {"title": "Log Out ➡", "payload": "LOGOUT"},
             ],
         )
     else:

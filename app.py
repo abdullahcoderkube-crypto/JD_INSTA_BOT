@@ -8,34 +8,68 @@ Flow:
     -> retailer types email
   AWAITING_PASSWORD
     -> retailer types password -> call jdwebnship Login API
-       success -> AUTHENTICATED, show Order button
+       success -> AUTHENTICATED, show Order buttons
        fail    -> back to AWAITING_EMAIL with error message
   AUTHENTICATED
-    -> show Order / Log Out buttons
+    -> show Place Order (AI) / Fill Manually / Log Out buttons
+
+  === AI flow (ORDER_AI_COLLECT) ===
+  ORDER_AI_COLLECT
+    -> retailer sends free-form text or a photo with order details
+    -> Groq extracts all fields; merges onto existing temp_data
+    -> if all required fields present -> ORDER_CONFIRM
+    -> if fields still missing -> stay in ORDER_AI_COLLECT, tell retailer what's needed
+
+  === Manual wizard flow (ORDER_<field>) ===
   ORDER_<field>
-    -> walks through every REQUIRED_ORDER field one at a time (text prompts,
-       or quick-reply buttons for constrained fields like product_weight and
-       payment_method), then asks whether to add optional details, then
-       walks OPTIONAL_ORDER fields (each skippable), then confirms and
-       calls Order Create.
+    -> walks through every REQUIRED_ORDER field one at a time, then optional fields,
+       then confirms and calls Order Create.
+
+  ORDER_CONFIRM
+    -> retailer confirms or cancels
 
 Run:
-    export PAGE_ACCESS_TOKEN=... VERIFY_TOKEN=... APP_SECRET=... FERNET_KEY=...
-    export JD_LOGIN_URL=... JD_ORDER_CREATE_URL=...
+    set PAGE_ACCESS_TOKEN=... VERIFY_TOKEN=... APP_SECRET=... FERNET_KEY=...
+    set JD_LOGIN_URL=... JD_ORDER_CREATE_URL=... GROQ_API_KEY=...
     python app.py
 """
 import hashlib
 import hmac
+import os
 
+import requests as _requests
 from flask import Flask, request
 
 import config
+import groq_client
 import jdwebnship_client
 import messenger_client
 import state_manager
 
 app = Flask(__name__)
 state_manager.init_db()
+
+# ---------------------------------------------------------------------------
+# ngrok tunnel -- started at process boot so we always have a public URL
+# ---------------------------------------------------------------------------
+
+NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "3Ifp6tJa3CtcgzXN9MGF0h93o2e_41Yrcv1nCrpJacYGbBdVX")
+
+def _start_ngrok(port: int = 5000):
+    try:
+        from pyngrok import ngrok, conf as ngrok_conf
+        ngrok_conf.get_default().auth_token = NGROK_AUTHTOKEN
+        tunnel = ngrok.connect(port, "http")
+        public_url = tunnel.public_url.replace("http://", "https://")
+        print(f"\n{'='*60}", flush=True)
+        print(f"  ngrok tunnel active!", flush=True)
+        print(f"  Public URL : {public_url}", flush=True)
+        print(f"  Webhook URL: {public_url}/webhook", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        return public_url
+    except Exception as exc:
+        print(f"[ngrok] Could not start tunnel: {exc}", flush=True)
+        return None
 
 # ---------------------------------------------------------------------------
 # Order field definitions — matches jdwebnship's /api/bot/direct-order payload
@@ -128,7 +162,8 @@ def receive_webhook():
         return "Invalid signature", 403
 
     body = request.get_json(force=True, silent=True) or {}
-    print(f"[webhook] Payload: {body}", flush=True)
+    safe_body = str(body).encode("ascii", errors="replace").decode("ascii")
+    print(f"[webhook] Payload: {safe_body}", flush=True)
 
     for entry in body.get("entry", []):
         for event in entry.get("messaging", []):
@@ -141,8 +176,16 @@ def receive_webhook():
                     continue  # ignore messages the bot itself sent
                 if "quick_reply" in msg:
                     handle_postback(psid, msg["quick_reply"].get("payload", ""))
-                elif "text" in msg:
-                    handle_text(psid, msg["text"].strip())
+                else:
+                    # Extract image URL if present (works for both Instagram and Messenger)
+                    image_url = None
+                    for att in msg.get("attachments", []):
+                        if att.get("type") == "image":
+                            image_url = att.get("payload", {}).get("url")
+                            break
+                    text = msg.get("text", "").strip()
+                    if text or image_url:
+                        handle_text(psid, text, image_url=image_url)
     return "OK", 200
 
 
@@ -221,19 +264,22 @@ def validate_field(field_key: str, text: str):
     return True, text
 
 
-def confirm_order(psid: str, order: dict):
+def confirm_order(psid: str, order: dict, language: str = "English"):
+    pm = order.get("payment_method", "cod")
+    pm_label = "Prepaid" if pm == "prepaid" else "Cash on Delivery (COD)"
     lines = ["Please confirm this order:\n"]
-    lines.append(f"{FIELD_LABELS['payment_method']}: Cash on Delivery (COD)")
+    lines.append(f"{FIELD_LABELS['payment_method']}: {pm_label}")
     for field in REQUIRED_ORDER + OPTIONAL_ORDER:
         if order.get(field):
             lines.append(f"{FIELD_LABELS[field]}: {order[field]}")
-    messenger_client.send_text(psid, "\n".join(lines))
+    summary = groq_client.localize("\n".join(lines), language)
+    messenger_client.send_text(psid, summary)
     messenger_client.send_quick_replies(
         psid,
         "Confirm and place this order?",
         [
-            {"title": "✅ Confirm", "payload": "ORDER_CONFIRM_YES"},
-            {"title": "❌ Cancel", "payload": "ORDER_CONFIRM_NO"},
+            {"title": "Confirm", "payload": "ORDER_CONFIRM_YES"},
+            {"title": "Cancel", "payload": "ORDER_CONFIRM_NO"},
         ],
     )
 
@@ -258,6 +304,21 @@ def handle_postback(psid: str, payload: str):
         messenger_client.main_menu(psid, authenticated=False)
 
     elif payload == "ORDER":
+        # AI-assisted free-form order collection
+        if not session["auth_token"]:
+            messenger_client.send_text(psid, "Please log in first.")
+            messenger_client.main_menu(psid, authenticated=False)
+            return
+        state_manager.update_session(psid, state="ORDER_AI_COLLECT", temp_data={})
+        messenger_client.send_text(
+            psid,
+            "Send me the order details in any language -- product name, price, quantity, "
+            "customer name, mobile, address, pincode and payment method (COD/Prepaid). "
+            "You can send it all in one message or even send a photo of the order sheet!"
+        )
+
+    elif payload == "ORDER_MANUAL":
+        # Classic step-by-step wizard
         if not session["auth_token"]:
             messenger_client.send_text(psid, "Please log in first.")
             messenger_client.main_menu(psid, authenticated=False)
@@ -288,6 +349,11 @@ def handle_postback(psid: str, payload: str):
         confirm_order(psid, session["temp_data"])
 
     elif payload == "ORDER_CONFIRM_YES":
+        # Guard against stale replayed messages from Meta retries.
+        # Only submit if the session is actually in ORDER_CONFIRM state.
+        if session["state"] != "ORDER_CONFIRM":
+            print(f"[postback] Ignoring stale ORDER_CONFIRM_YES (state={session['state']})", flush=True)
+            return
         submit_order(psid, session)
 
     elif payload == "ORDER_CONFIRM_NO":
@@ -300,19 +366,22 @@ def handle_postback(psid: str, payload: str):
 # Free-text handling (email, password, order field values)
 # ---------------------------------------------------------------------------
 
-def handle_text(psid: str, text: str):
+def handle_text(psid: str, text: str, image_url: str = None):
     session = state_manager.get_session(psid)
     state = session["state"]
 
+    # ------------------------------------------------------------------
+    # Login flow
+    # ------------------------------------------------------------------
     if state == "AWAITING_EMAIL":
         temp = session["temp_data"]
-        temp["email"] = text
+        temp["login_email"] = text
         state_manager.update_session(psid, state="AWAITING_PASSWORD", temp_data=temp)
         messenger_client.send_text(psid, "Thanks. Now enter your password:")
         return
 
     if state == "AWAITING_PASSWORD":
-        email = session["temp_data"].get("email")
+        email = session["temp_data"].get("login_email")
         password = text  # used once below, never stored
         success, data = jdwebnship_client.login(email, password)
         password = None  # drop reference immediately after use
@@ -331,7 +400,17 @@ def handle_text(psid: str, text: str):
             messenger_client.send_text(psid, "Please re-enter your email address:")
         return
 
-    if state.startswith("ORDER_") and state not in ("ORDER_ASK_OPTIONAL", "ORDER_CONFIRM"):
+    # ------------------------------------------------------------------
+    # AI order collection state
+    # ------------------------------------------------------------------
+    if state == "ORDER_AI_COLLECT":
+        handle_ai_order_input(psid, session, text, image_url)
+        return
+
+    # ------------------------------------------------------------------
+    # Manual wizard: one field at a time
+    # ------------------------------------------------------------------
+    if state.startswith("ORDER_") and state not in ("ORDER_ASK_OPTIONAL", "ORDER_CONFIRM", "ORDER_AI_COLLECT"):
         field = state.split("ORDER_", 1)[1]
         if field in FIELD_DEFS:
             if FIELD_DEFS[field]["type"] == "choice":
@@ -347,24 +426,106 @@ def handle_text(psid: str, text: str):
             advance_order(psid, temp, field)
             return
 
-    # Fallback — unrecognised input for current state
+    # Fallback -- unrecognised input for current state
     messenger_client.main_menu(psid, authenticated=bool(session["auth_token"]))
+
+
+# ---------------------------------------------------------------------------
+# AI order input handler
+# ---------------------------------------------------------------------------
+
+def handle_ai_order_input(psid: str, session: dict, text: str, image_url: str = None):
+    """Process a free-form message via Groq and update the order draft."""
+    messenger_client.send_text(psid, "Got it! Extracting order details...")
+
+    try:
+        result = groq_client.extract_order(text, image_url)
+    except Exception as exc:
+        print(f"[groq] extract_order failed: {exc}", flush=True)
+        messenger_client.send_text(
+            psid,
+            "Sorry, I couldn't process that right now. "
+            "Please try again or use 'Fill Manually' from the menu."
+        )
+        return
+
+    language = result.get("language", "English")
+
+    if not result.get("is_order_request"):
+        reply = groq_client.localize(
+            "That doesn't look like an order. Please send the product name, price, "
+            "customer details and address, or tap 'Fill Manually' to use the step-by-step form.",
+            language,
+        )
+        messenger_client.send_text(psid, reply)
+        return
+
+    # Merge newly extracted fields onto the existing draft
+    existing = session["temp_data"]
+    merged = groq_client.merge_into_temp(existing, result.get("order") or {})
+    # Ensure payment_method defaults to cod if Groq couldn't find it
+    if not merged.get("payment_method"):
+        merged["payment_method"] = "cod"
+
+    missing = result.get("missing_required", [])
+    # Re-check missing after merge (Groq might have filled some from earlier messages)
+    missing = [f for f in groq_client.REQUIRED_FIELDS if not merged.get(f)]
+
+    print(f"[groq] language={language} merged={merged} missing={missing}", flush=True)
+
+    if missing:
+        missing_labels = [groq_client.FIELD_LABELS[f] for f in missing]
+        state_manager.update_session(psid, state="ORDER_AI_COLLECT", temp_data=merged)
+        needed_str = ", ".join(missing_labels)
+        reply = groq_client.localize(
+            f"Thanks! I still need the following details:\n{needed_str}\n\nPlease send them.",
+            language,
+        )
+        messenger_client.send_text(psid, reply)
+    else:
+        # All required fields present -- go straight to confirmation
+        state_manager.update_session(psid, state="ORDER_CONFIRM", temp_data=merged)
+        confirm_order(psid, merged, language=language)
 
 
 # ---------------------------------------------------------------------------
 # Order submission
 # ---------------------------------------------------------------------------
 
-def _to_number(text: str):
-    return float(text) if "." in text else int(text)
+def _to_number(val):
+    """Convert a value to int or float. Handles both string and native numeric types
+    (Groq returns price/qty as actual numbers, the manual wizard stores them as strings)."""
+    if isinstance(val, (int, float)):
+        return val
+    val = str(val).strip()
+    return float(val) if "." in val else int(val)
 
 
 def submit_order(psid: str, session: dict):
     order = session["temp_data"]
 
+    # Sanity-check: required fields must all be present.
+    # Protects against stale sessions or corrupt temp_data.
+    REQUIRED_SUBMIT = [
+        "product_name", "qty", "price", "product_weight",
+        "payment_method", "customer_mobile", "customer_full_name",
+        "customer_address", "pincode",
+    ]
+    missing = [f for f in REQUIRED_SUBMIT if not order.get(f)]
+    if missing:
+        print(f"[submit_order] Missing fields: {missing} — aborting", flush=True)
+        messenger_client.send_text(
+            psid,
+            "Something went wrong — some order details are missing. "
+            "Please start a new order."
+        )
+        state_manager.update_session(psid, state="AUTHENTICATED", temp_data={})
+        messenger_client.main_menu(psid, authenticated=True)
+        return
+
     payload = {
         "product_name": order["product_name"],
-        "qty": int(order["qty"]),
+        "qty": int(_to_number(order["qty"])),
         "price": _to_number(order["price"]),
         "product_weight": order["product_weight"],
         "payment_method": order["payment_method"],
@@ -378,7 +539,9 @@ def submit_order(psid: str, session: dict):
         if order.get(field):
             payload[field] = order[field]
 
+    print(f"[submit_order] Sending payload: {payload}", flush=True)
     success, data = jdwebnship_client.create_order(session["auth_token"], payload)
+    print(f"[submit_order] Result: success={success} data={data}", flush=True)
 
     if success:
         order_ref = data.get("order_id", "N/A")
@@ -398,4 +561,5 @@ def submit_order(psid: str, session: dict):
 
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    
+    app.run(port=80, debug=False, use_reloader=False)

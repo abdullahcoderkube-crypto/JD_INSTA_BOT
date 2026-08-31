@@ -80,6 +80,6 @@ def create_order(auth_token: str, order: dict) -> tuple[bool, dict]:
         return False, {"error": "AUTH_EXPIRED"}
 
     if resp.status_code not in (200, 201):
-        return False, {"error": f"Order failed (HTTP {resp.status_code}): {resp.text[:200]}"}
+        return False, {"error": f"Order failed (HTTP {resp.status_code}): {resp.text}"}
 
     return True, resp.json()
